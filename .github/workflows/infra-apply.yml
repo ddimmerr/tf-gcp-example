@@ -1,0 +1,34 @@
+name: GCP Infrastructure - Manual Apply
+
+on:
+  # only manual
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  terraform-apply:
+    name: Execute Terraform Apply
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+
+      - name: Terraform Apply (Live Execution)
+        run: |
+          cd terraform
+          terraform apply -auto-approve -var="project_id=${{ env.GCP_PROJECT_ID }}"

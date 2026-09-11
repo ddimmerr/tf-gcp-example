@@ -1,0 +1,116 @@
+name: Deploy Multi-Env Application via GCP Registry
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  GCP_REGION: us-central1
+  GAR_REPOSITORY: app-repo
+
+jobs:
+  # =========================================================================
+  # JOB 1: GOOGLE CLOUD AUTHENTICATION & IMAGE BUILD
+  # =========================================================================
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Docker Auth to Google Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Image to Artifact Registry
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/hello-gcp:latest
+
+  # =========================================================================
+  # JOB 2: GCP DYNAMIC IP DISCOVERY
+  # =========================================================================
+  discover-ip:
+    name: Discover VM Network IP
+    runs-on: ubuntu-latest
+    outputs:
+      vm_ip: ${{ steps.get-ip.outputs.ip }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch Live Ephemeral VM IP
+        id: get-ip
+        run: |
+          RAW_IP=$(gcloud compute instances describe free-docker-host \
+            --zone=us-central1-a \
+            --format='get(networkInterfaces.accessConfigs.natIP)')
+          CLEAN_IP=$(echo "$RAW_IP" | tr -d '[]\n\r ')
+          echo "ip=$CLEAN_IP" >> $GITHUB_OUTPUT
+
+  # =========================================================================
+  # JOB 3: VM DELIVERY & MULTI-CONTAINER BOOT
+  # =========================================================================
+  deploy-containers:
+    name: Deliver & Boot Containers
+    needs: [build-and-push, discover-ip]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+
+      # FIX: Using << 'EOF' hereditary block input to cleanly pass the multi-variable array without any quote clashing bugs
+      - name: SSH Deploy and Restart Containers via Native SSH
+        env:
+          VM_GCP_KEY: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@${{ needs.discover-ip.outputs.vm_ip }} << 'EOF'
+            IMAGE_URI="${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/hello-gcp:latest"
+            
+            echo '${{ secrets.GCP_CREDENTIALS }}' > /tmp/gcp_key.json
+            
+            # Authenticate execution profile
+            sudo gcloud auth activate-service-account --key-file=/tmp/gcp_key.json --quiet
+            echo 'y' | sudo gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+            
+            rm -f /tmp/gcp_key.json
+            
+            # Pull down the fresh image layer
+            sudo docker pull $IMAGE_URI
+            
+            # Stop and remove any old running container versions to clear port locks
+            sudo docker rm -f app-dev app-staging app-prod 2>/dev/null || true
+            
+            # Boot containers natively with full variable arrays injected
+            sudo docker run -d --name app-dev     --restart always -p 8081:8080 -e ENV_NAME=development -e NODE_ENV=development -e APP_ENV=dev $IMAGE_URI
+            sleep 5
+            sudo docker run -d --name app-staging --restart always -p 8082:8080 -e ENV_NAME=staging     -e NODE_ENV=staging     -e APP_ENV=staging $IMAGE_URI
+            sleep 5
+            sudo docker run -d --name app-prod    --restart always -p 8080:8080 -e ENV_NAME=production  -e NODE_ENV=production  -e APP_ENV=production $IMAGE_URI
+            
+            # Clean up old image fragments
+            sudo docker image prune -f
+          EOF
